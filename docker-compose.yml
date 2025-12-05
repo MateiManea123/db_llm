@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=ParolaTa123!
+    ports:
+      - "1433:1433"
+    volumes:
+      - sql_data:/var/opt/mssql        # ⬅️ volum named pentru TOT /var/opt/mssql
+      - sql_backups:/var/opt/mssql/backups
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: my_app
+    environment:
+      # conexiune spre SQL Server din interiorul rețelei compose
+      - SQLSERVER_HOST=sqlserver
+      - SQLSERVER_PORT=1433
+      - SQLSERVER_USER=sa
+      - SQLSERVER_PASSWORD=ParolaTa123!
+      # unde salvează app-ul .bak-urile (în volum comun)
+      - BAK_DIR=/backups
+      - BACKUP_SQL_DIR=/var/opt/mssql/backups
+    volumes:
+      # același volum ca la sqlserver, dar montat în altă cale în app
+      - sql_backups:/backups
+    ports:
+      - "8501:8501"  # dacă rulezi Streamlit
+    depends_on:
+      - sqlserver
+    restart: unless-stopped
+
+volumes:
+  sql_data:
+  sql_backups:
