@@ -1,223 +1,185 @@
 import os
+import uuid
 import dotenv
 import streamlit as st
 
 from db_methods import stream_db_response, has_db, load_db_generic
 
+
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 
-# ----------------- Config & helpers -----------------
+from rag_methods import (
+    load_doc_to_db,
+    load_url_to_db,
+    stream_llm_response,
+    stream_llm_rag_response,
+)
+
+# ---------- ENV & CONFIG ----------
 
 dotenv.load_dotenv()
 
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_ENDPOINT")
-AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
-AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-AZURE_DEPLOYMENT = (
-    os.getenv("AZURE_OPENAI_DEPLOYMENT")
-    or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
-    or "gpt-4o"  # schimbă dacă ai alt nume de deployment
-)
+AZURE_API_KEY = os.getenv("AZ_OPENAI_API_KEY")
+AZURE_ENDPOINT = os.getenv("AZ_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT = "gpt-4o"  # numele deployment-ului tău din Azure portal
+
+if not AZURE_API_KEY or not AZURE_ENDPOINT:
+    st.error(
+        "AZ_OPENAI_API_KEY sau AZ_OPENAI_ENDPOINT nu sunt setate în .env.\n"
+        "Adaugă-le și repornește aplicația."
+    )
+    st.stop()
+
+# un singur model: deployment-ul tău
+MODELS = [f"azure-openai/{AZURE_DEPLOYMENT}"]
+st.session_state.model = f"azure-openai/{AZURE_DEPLOYMENT}"
 
 st.set_page_config(
-    page_title="Blue SQL Copilot",
-    page_icon="💙",
-    layout="wide",
+    page_title="DB LLM",
+    page_icon="📚",
+    layout="centered",
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS pentru tematica albastră
-st.markdown(
-    """
-    <style>
-    .stApp {
-        background: radial-gradient(circle at top left, #0f172a 0, #020617 45%, #020617 100%);
-        color: #e5e7eb;
-    }
-    /* Container central mai îngust pentru chat */
-    .main > div {
-        max-width: 1100px;
-        margin: 0 auto;
-    }
-    /* Titlu mare */
-    .blue-title {
-        font-size: 2.4rem;
-        font-weight: 800;
-        background: linear-gradient(90deg, #38bdf8, #60a5fa);
-        -webkit-background-clip: text;
-        color: transparent;
-        margin-bottom: 0.25rem;
-    }
-    .blue-subtitle {
-        font-size: 0.98rem;
-        color: #9ca3af;
-        margin-bottom: 1.5rem;
-    }
-    /* Card de info */
-    .info-card {
-        border-radius: 16px;
-        padding: 1rem 1.25rem;
-        border: 1px solid rgba(59,130,246,0.4);
-        background: linear-gradient(135deg, rgba(15,23,42,0.9), rgba(15,23,42,0.6));
-        margin-bottom: 1.5rem;
-    }
-    .info-card h4 {
-        margin: 0 0 0.5rem 0;
-        font-size: 0.95rem;
-        color: #bfdbfe;
-    }
-    .info-card p {
-        margin: 0;
-        font-size: 0.9rem;
-        color: #e5e7eb;
-    }
-    /* Chat bubbles */
-    .stChatMessage[data-testid="stChatMessage"] {
-        border-radius: 18px;
-        padding: 0.75rem 1rem;
-        margin-bottom: 0.75rem;
-        border: 1px solid rgba(148,163,184,0.4);
-        background: rgba(15,23,42,0.85);
-    }
-    .stChatMessage[data-testid="stChatMessage"]:has(div[data-testid="stMarkdownContainer"] strong) {
-        border-color: rgba(59,130,246,0.6);
-    }
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #020617, #020617);
-        border-right: 1px solid rgba(30,64,175,0.7);
-    }
-    .sidebar-title {
-        font-size: 1.3rem;
-        font-weight: 700;
-        color: #e5e7eb;
-        margin-bottom: 0.25rem;
-    }
-    .sidebar-subtitle {
-        font-size: 0.85rem;
-        color: #9ca3af;
-        margin-bottom: 1rem;
-    }
-    .sidebar-section-title {
-        font-size: 0.9rem;
-        font-weight: 600;
-        color: #bfdbfe;
-        margin-top: 1.2rem;
-        margin-bottom: 0.3rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ---------- INITIAL SESSION STATE ----------
 
-# ----------------- Session state -----------------
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "rag_sources" not in st.session_state:
+    st.session_state.rag_sources = []
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi there! How can I assist you today?"},
+    ]
 
-# ----------------- Construim LLM-ul Azure (doar unul, fără selecție de model) -----------------
+# ---------- HEADER ----------
 
-if not AZURE_ENDPOINT or not AZURE_API_KEY:
-    llm_stream = None
-else:
-    llm_stream = AzureChatOpenAI(
-        azure_endpoint=AZURE_ENDPOINT,
-        openai_api_version=AZURE_API_VERSION,
-        model_name=AZURE_DEPLOYMENT,
-        openai_api_key=AZURE_API_KEY,
-        openai_api_type="azure",
-        temperature=0.2,
-        streaming=True,
-    )
+st.html(
+    """<h2 style="text-align: center;">📚 <i> DB LLM </i> 💬</h2>"""
+)
 
-# ----------------- SIDEBAR: Setup DB -----------------
-
+# ---------- SIDEBAR: MODEL + RAG SOURCES ----------
 with st.sidebar:
-    st.markdown('<div class="sidebar-title">💙 Blue SQL Copilot</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="sidebar-subtitle">Asistent specializat doar pe baza ta de date SQL Server.</div>',
-        unsafe_allow_html=True,
+
+    st.divider()
+
+    # adăugăm și modul DB Assistant
+    mode = st.radio(
+        "Mode",
+        options=["DB Assistant"],
+        index=0,
+        key="chat_mode",
     )
 
-    st.markdown('<div class="sidebar-section-title">1️⃣ Încarcă backup-ul (.bak)</div>', unsafe_allow_html=True)
+
+
+    cols0 = st.columns(2)
+    with cols0[0]:
+        is_vector_db_loaded = (
+            "vector_db" in st.session_state
+            and st.session_state.vector_db is not None
+        )
+        st.toggle(
+            "Use RAG",
+            value=(mode == "RAG" and is_vector_db_loaded),
+            key="use_rag",
+            disabled=(mode != "RAG" or not is_vector_db_loaded),
+        )
+
+    with cols0[1]:
+        st.button(
+            "Clear Chat",
+            on_click=lambda: st.session_state.messages.clear(),
+            type="primary",
+        )
+
+    st.header("RAG Sources:")
+
+    # File upload input for RAG with documents
+    st.file_uploader(
+        "📄 Upload a document",
+        type=["pdf", "txt", "docx", "md"],
+        accept_multiple_files=True,
+        on_change=load_doc_to_db,
+        key="rag_docs",
+    )
+    st.header("🗄️ Database (SQL Server from .bak)")
 
     st.file_uploader(
-        "Upload SQL Server .bak",
+        "Upload .bak (SQL Server backup)",
         type=["bak"],
         key="db_file",
         on_change=load_db_generic,
     )
 
-    st.markdown('<div class="sidebar-section-title">2️⃣ Status bază de date</div>', unsafe_allow_html=True)
-
     if has_db():
-        st.success("Baza de date este încărcată și gata de interogat. ✅")
+        st.success("Database loaded from .sql ✅")
     else:
-        st.info("Încarcă un fișier .bak pentru a porni asistentul. ℹ️")
-
-    st.markdown("---")
-    st.caption(
-        "Asistentul generează T-SQL pe baza schemei bazei tale de date și explică rezultatul în limbaj natural."
+        st.info("No database loaded yet.")
+    # URL input for RAG with websites
+    st.text_input(
+        "🌐 Introduce a URL",
+        placeholder="https://example.com",
+        on_change=load_url_to_db,
+        key="rag_url",
     )
 
-# ----------------- MAIN: Chat doar pentru DB -----------------
+    with st.expander(
+        f"📚 Documents in DB ({0 if not is_vector_db_loaded else len(st.session_state.rag_sources)})"
+    ):
+        st.write(
+            []
+            if not is_vector_db_loaded
+            else [source for source in st.session_state.rag_sources]
+        )
 
-st.markdown('<div class="blue-title">Blue SQL Copilot</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="blue-subtitle">Pune întrebări în română despre baza ta de date SQL Server. '
-    "Asistentul gândește interogări T-SQL și le explică.</div>",
-    unsafe_allow_html=True,
+# ---------- MAIN CHAT APP ----------
+
+model_provider = st.session_state.model.split("/")[0]  # "azure-openai"
+model_name = st.session_state.model.split("/")[-1]     # "gpt-4o"
+
+# construim LLM-ul Azure
+llm_stream = AzureChatOpenAI(
+    azure_endpoint=AZURE_ENDPOINT,
+    openai_api_version="2024-02-15-preview",
+    model_name=model_name,  # deployment name, e.g. "gpt-4o"
+    openai_api_key=AZURE_API_KEY,
+    openai_api_type="azure",
+    temperature=0.3,
+    streaming=True,
 )
 
-st.markdown(
-    """
-    <div class="info-card">
-      <h4>ℹ️ Cum îl poți folosi</h4>
-      <p>
-        Întreabă lucruri de genul:<br/>
-        • „Câți angajați activi sunt în baza de date?”<br/>
-        • „Arată-mi top 5 produse după vânzări.”<br/>
-        • „Există comenzi fără client asociat?”<br/>
-      </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-if not llm_stream:
-    st.error("Lipsesc variabilele de mediu pentru Azure OpenAI (endpoint / key).")
-    st.stop()
-
-if not has_db():
-    st.warning("Încarcă un fișier .bak în sidebar pentru a începe conversația.")
-    # Totuși, afișăm istoricul (dacă există), dar nu permitem input nou
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    st.stop()
-
-# Afișăm istoricul de chat
+# afișăm istoricul
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Input nou de la utilizator (doar chat DB)
-prompt = st.chat_input("Scrie o întrebare despre baza de date...")
-
-if prompt:
-    # salvăm mesajul utilizatorului
+# mesaj nou
+if prompt := st.chat_input("Your message"):
     st.session_state.messages.append({"role": "user", "content": prompt})
-
-    # randăm mesajul utilizatorului
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # pregătim istoricul pentru LLM (HumanMessage / AIMessage)
-    lc_history = [
-        HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"])
-        for m in st.session_state.messages
-    ]
-
-    # mesajul asistentului (DB Assistant only)
     with st.chat_message("assistant"):
-        st.write_stream(stream_db_response(llm_stream, lc_history))
+        # convertim istoricul în mesaje LangChain
+        lc_history = [
+            HumanMessage(content=m["content"])
+            if m["role"] == "user"
+            else AIMessage(content=m["content"])
+            for m in st.session_state.messages
+        ]
+
+        if mode == "Normal Chat":
+            st.write_stream(stream_llm_response(llm_stream, lc_history))
+
+        elif mode == "RAG":
+            st.write_stream(stream_llm_rag_response(llm_stream, lc_history))
+
+        elif mode == "DB Assistant":
+            # aici folosim schema DB-ului + history
+            st.write_stream(stream_db_response(llm_stream, lc_history))
+
