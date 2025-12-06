@@ -214,66 +214,205 @@ def get_schema_summary() -> str:
 # ----------------- LLM streaming pentru DB Assistant -----------------
 
 
-def stream_db_response(llm_stream, history_messages: Iterable):
+def stream_db_response(llm, history_messages):
     """
-    LLM care răspunde la întrebări despre baza de date SQL Server.
-
-    Parametri:
-      - llm_stream: un obiect LLM cu metoda .stream(messages)
-      - history_messages: listă de mesaje LangChain (UserMessage, AIMessage etc.)
-
-    Comportament:
-      - verifică dacă există o DB încărcată din .bak
-      - extrage schema cu get_schema_summary()
-      - construiește un SystemMessage cu instrucțiuni clare pentru SQL Server (T-SQL)
-      - transmite mesajele către LLM și face stream în UI
+    DB Assistant "inteligent":
+      - Dacă întrebarea poate fi rezolvată cu SQL:
+          1) generează T-SQL
+          2) execută query-ul pe SQL Server
+          3) explică rezultatul în limbaj natural
+      - Dacă nu se poate (SQL invalid / întrebare conceptuală):
+          -> răspunde ca un LLM normal, folosind schema DB ca context.
     """
 
-    # 1. trebuie să avem DB
+    # --- 0. verificăm DB ---
     if not has_db():
-        msg = "No database loaded. Please upload a .bak (SQL Server backup) first."
+        msg = "Nu există nicio bază de date încărcată. Încarcă un fișier .bak mai întâi."
         st.session_state.messages.append({"role": "assistant", "content": msg})
         yield msg
         return
 
-    # 2. schema DB-ului
     schema_text = get_schema_summary()
     if schema_text in ("NO_DB", "NO_TABLES"):
-        msg = "Database is empty or has no user tables. Please check your .bak file."
+        msg = "Baza de date este goală sau nu are tabele de utilizator. Verifică fișierul .bak."
         st.session_state.messages.append({"role": "assistant", "content": msg})
         yield msg
         return
 
-    # 3. System prompt pentru LLM
-    system_content = f"""You are a SQL assistant over a Microsoft SQL Server database.
+    # ultima întrebare a user-ului
+    user_question = None
+    if history_messages:
+        last_msg = history_messages[-1]
+        try:
+            user_question = last_msg.content
+        except AttributeError:
+            user_question = str(last_msg)
+    if not user_question:
+        msg = "Nu am putut determina întrebarea utilizatorului."
+        st.session_state.messages.append({"role": "assistant", "content": msg})
+        yield msg
+        return
 
-The database engine is SQL Server. Use T-SQL syntax compatible with SQL Server.
+    # ---- helper pentru fallback: răspuns ca LLM normal peste schema DB ----
 
-Here is the database schema (tables and columns):
+    def fallback_normal_answer(reason: str = ""):
+        system_fallback = (
+            "You are an AI assistant that answers questions about a Microsoft SQL Server database.\n\n"
+            "You have access to the database schema (tables and columns) below.\n"
+            "Use it as context, but you do NOT need to always write SQL.\n"
+            "You can answer conceptually, explain relationships, suggest queries, etc.\n\n"
+            "Database schema:\n\n"
+            f"{schema_text}\n\n"
+            "Answer the user's question in a clear and friendly way (in Romanian if the user writes in Romanian)."
+        )
 
-{schema_text}
+        messages = [SystemMessage(content=system_fallback)]
+        messages.extend(history_messages)
 
-When the user asks something, you MUST:
-1. Think step by step about what they want.
-2. Propose one or more T-SQL queries that answer the question or modify the data.
-3. Explain the query in natural language.
-4. Return the SQL inside a fenced code block like:
+        response = llm.invoke(messages)
+        answer = response.content or "Nu am reușit să formulez un răspuns."
 
-```sql
-SELECT ...
-Do NOT invent tables or columns that are not in the schema.
-If something cannot be done with this schema, clearly say so.
-"""
-    lc_messages = [SystemMessage(content=system_content)]
-    lc_messages.extend(history_messages)
+        if reason:
+            # opțional: poți comenta motivul în debug log, dar nu e obligatoriu să îl afișezi user-ului
+            print(f"[DB ASSISTANT FALLBACK] {reason}")
 
-    response_message = ""
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        return answer
 
-    # 4. Facem stream din LLM
-    for chunk in llm_stream.stream(lc_messages):
-        response_message += chunk.content
-        # chunk e un obiect LangChain (AIMessageChunk); îl dăm mai departe caller-ului
-        yield chunk
+    # --- 1. ÎNCERCĂM varianta cu SQL ---
 
-    # 5. persistăm răspunsul în session_state pentru UI
-    st.session_state.messages.append({"role": "assistant", "content": response_message})
+    # 1.1. Generăm SQL cu un prompt specializat
+    system_generate_sql = (
+        "You are an assistant that generates ONLY T-SQL queries for Microsoft SQL Server.\n\n"
+        "The database engine is SQL Server. Use standard T-SQL.\n\n"
+        "You will receive the user's last question and the database schema.\n"
+        "Your task:\n"
+        "- Understand the question.\n"
+        "- Generate EXACTLY ONE T-SQL query that answers it.\n"
+        "- Return the query inside a single fenced code block.\n"
+        "- Do NOT write explanations or any other text outside the code block.\n\n"
+        "Here is the database schema:\n\n"
+        f"{schema_text}\n\n"
+        "Return ONLY the SQL query."
+    )
+
+    sql_messages = [
+        SystemMessage(content=system_generate_sql),
+        history_messages[-1],  # doar ultima întrebare
+    ]
+
+    try:
+        sql_response = llm.invoke(sql_messages)
+    except Exception as e:
+        # dacă modelul nu răspunde, facem fallback direct
+        ans = fallback_normal_answer(reason=f"LLM SQL generation error: {e}")
+        yield ans
+        return
+
+    raw = sql_response.content or ""
+
+    # 1.2. Extragem SQL-ul din blocul ```...```
+    sql = None
+    if "```" in raw:
+        first = raw.find("```") + 3
+        last = raw.rfind("```")
+        sql = raw[first:last].strip()
+    else:
+        sql = raw.strip()
+
+    # curățăm prefixe de tip "sql"/"tsql"
+    if sql:
+        lines = sql.splitlines()
+        if lines and lines[0].strip().lower() in ("sql", "tsql"):
+            sql = "\n".join(lines[1:]).strip()
+
+    # dacă nu a putut genera un SQL clar -> fallback
+    if not sql:
+        ans = fallback_normal_answer(reason="No SQL extracted from model output.")
+        yield ans
+        return
+
+    # 1.3. Executăm SQL-ul
+    try:
+        columns, rows = run_sql_query(sql)
+    except Exception as e:
+        # de exemplu dacă întrebare nu are sens ca SQL
+        ans = fallback_normal_answer(reason=f"SQL execution failed: {e}")
+        yield ans
+        return
+
+    # --- 2. Dacă totul a mers, cerem LLM-ului să explice rezultatul ---
+
+    max_rows_for_llm = 50
+    sample_rows = rows[:max_rows_for_llm]
+
+    result_payload = {
+        "question": user_question,
+        "sql": sql,
+        "columns": columns,
+        "rows_sample": sample_rows,
+        "total_rows": len(rows),
+    }
+
+    system_explain = (
+        "You are an assistant that answers questions about a Microsoft SQL Server database.\n\n"
+        "You will be given:\n"
+        "- the original user question (in Romanian or English),\n"
+        "- the T-SQL query that was executed,\n"
+        "- the query result (column names and rows, possibly truncated),\n"
+        "- the total number of rows.\n\n"
+        "Your job is to:\n"
+        "- Explain the answer in a friendly, concise way in Romanian.\n"
+        "- Use the actual query results to answer (do NOT hallucinate values).\n"
+        "- If the result is a single value (1 row, 1 column), highlight that value.\n"
+        "- Optionally, show a small Markdown table if there are multiple rows.\n"
+        "- You may optionally show the SQL query at the end in a code block.\n"
+    )
+
+    explain_messages = [
+        SystemMessage(content=system_explain),
+        SystemMessage(content=f"Execution context (Python-style dict):\n\n{result_payload}"),
+    ]
+
+    explain_response = llm.invoke(explain_messages)
+    final_answer = explain_response.content or "Nu am reușit să formulez un răspuns."
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": final_answer}
+    )
+
+    yield final_answer
+
+
+
+
+# --------------------------------------------------------------
+# RUN SQL QUERY (folosit de stream_db_response)
+# --------------------------------------------------------------
+
+def run_sql_query(sql: str):
+    """
+    Rulează un query T-SQL pe baza curentă.
+    Returnează: (lista_de_coloane, lista_de_rânduri)
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+        # extragem numele de coloane din cursor.description
+        if cur.description:
+            columns = [col[0] for col in cur.description]
+        else:
+            columns = []
+
+        # dacă avem dict-uri din pytds
+        if rows and isinstance(rows[0], dict):
+            normalized = [[r.get(col) for col in columns] for r in rows]
+        else:
+            normalized = [list(r) for r in rows]
+
+        return columns, normalized
+    finally:
+        conn.close()
